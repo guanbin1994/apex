@@ -20,12 +20,13 @@ __device__ __forceinline__ int lastpow2(int n)
 }
 
 __host__ __forceinline__ int h_next_pow2(unsigned int n) {
+    unsigned int old = n;
     n |= (n >>  1);
     n |= (n >>  2);
     n |= (n >>  4);
     n |= (n >>  8);
     n |= (n >> 16);
-    return n + 1;
+    return n == old? n : n + 1;
 }
 
 __host__ __forceinline__ int h_last_pow2(unsigned int n) {
@@ -71,7 +72,8 @@ __device__ __forceinline__ T reduce_block(T *x, T val)
 }
 
 #define TILE_W 32
-#define MAX_BLOCK_SIZE 256
+//#define MAX_BLOCK_SIZE 256
+#define MAX_BLOCK_SIZE 1024
 
 template<typename T>
 __device__ __forceinline__ void warp_reduce_mean_m2n(T &mean, T &m2n, int &num)
@@ -81,12 +83,11 @@ __device__ __forceinline__ void warp_reduce_mean_m2n(T &mean, T &m2n, int &num)
     auto num_new = __shfl_down_sync(0xffffffff, num, i);
     auto mean_new = __shfl_down_sync(0xffffffff, mean, i);
     auto m2n_new = __shfl_down_sync(0xffffffff, m2n, i);
-    if (num_new != 0) {
-      auto dif_mean = mean - mean_new;
-      mean = (mean_new * num_new + mean * num) / (num + num_new);
-      m2n += m2n_new + dif_mean*dif_mean*num*num_new/(num_new+num);
-      num += num_new;
-    }
+    T factor = 1.0 / max(1, (num+num_new));
+    auto dif_mean = mean - mean_new;
+    mean = (mean_new * num_new + mean * num)*factor;
+    m2n += m2n_new + dif_mean*dif_mean*num*num_new*factor;
+    num += num_new;
   }
 }
 
@@ -124,6 +125,30 @@ __device__ void welford_reduce_mean_m2n(
   return;
 }
 
+template <typename T>
+__device__ void welford_reduce_mean_m2n_tree(
+      T* __restrict__ mean_l,
+      T* __restrict__ m2n_l,
+      int* __restrict__ num_item_l,
+      int block_size,
+      int thread_id)
+{
+  for (int offset = lastpow2(block_size); offset > 0; offset>>=1) {
+    if (thread_id < offset && thread_id + offset < block_size) {
+      auto count = num_item_l[thread_id];
+      auto val = mean_l[thread_id];
+      auto count2 = num_item_l[thread_id+offset];
+      auto val2 = mean_l[thread_id+offset];
+
+      mean_l[thread_id] = (val * count + val2 * count2) / (count + count2);
+      val = val - val2;
+      m2n_l[thread_id] += m2n_l[thread_id + offset] + val*val*count*count2/(count+count2);
+      num_item_l[thread_id] = count + count2;
+    }
+    __syncthreads();
+  }
+}
+
 // return spatial size for NC+ Tensors
 __host__ int get_tensor_spatial_size(const at::Tensor& input)
 {
@@ -159,11 +184,7 @@ __global__ void welford_kernel(
       const int bs,
       const int fs,
       const int ss) {
-  static __shared__ int s_mem[160];
   int block_size = blockDim.x * blockDim.y;
-
-  accscalar_t* s_mem_ac = (accscalar_t*) &s_mem[32];
-
   int count = 0;
   accscalar_t x_mean = accscalar_t(0);
   accscalar_t m_2_n = accscalar_t(0);
@@ -175,16 +196,37 @@ __global__ void welford_kernel(
     // sequential welford
     for (int offset = threadIdx.x; offset < ss ; offset += blockDim.x) {
       count++;
+      //auto x_n = static_cast<accscalar_t>(input[offset+input_base]);
+      //auto x_mean_new = x_mean + (x_n - x_mean) / count;
+      //m_2_n = m_2_n + (x_n - x_mean_new) * (x_n - x_mean);
+      //x_mean = x_mean_new;
       auto x_n = static_cast<accscalar_t>(input[offset+input_base]);
-      auto x_mean_new = x_mean + (x_n - x_mean) / count;
-      m_2_n = m_2_n + (x_n - x_mean_new) * (x_n - x_mean);
-      x_mean = x_mean_new;
+      auto d = x_n - x_mean;
+      x_mean += d / count;
+      m_2_n += d * (x_n - x_mean);
     }
   }
 
+  static __shared__ int s_mem[160];
+  accscalar_t* s_mem_ac = (accscalar_t*) &s_mem[32];
+
   welford_reduce_mean_m2n<accscalar_t>(s_mem_ac, s_mem, x_mean, m_2_n, count, block_size, thread_id);
 
+  // extern __shared__ int s_mem[];
+  // accscalar_t* mean_l = (accscalar_t*) s_mem;
+  // accscalar_t* m2n_l = &(mean_l[block_size]);
+  // int *num_item_l = (int*) &(m2n_l[block_size]);
+  // // allow idle thread to write to shared memory
+  // mean_l[thread_id] = x_mean;
+  // m2n_l[thread_id] = m_2_n;
+  // num_item_l[thread_id] = count;
+  // __syncthreads();
+
+  // welford_reduce_mean_m2n_tree<accscalar_t>(mean_l, m2n_l, num_item_l, block_size, thread_id);
   if (thread_id == 0) {
+    // x_mean = mean_l[0];
+    // m_2_n = m2n_l[0];
+    // count = num_item_l[0];
     out_mean[blockIdx.x] = static_cast<outscalar_t>(x_mean);
     out_var[blockIdx.x] = static_cast<outscalar_t>(m_2_n/(count-1));
     out_var_biased[blockIdx.x] = static_cast<outscalar_t>(m_2_n/count);
@@ -201,16 +243,18 @@ __global__ void batchnorm_forward_kernel(
       const layerscalar_t* __restrict__ shift,
       scalar_t* __restrict__ out,
       const int ss,
+      const int bs,
       const float eps) {
-  int address_base = blockIdx.x*ss + blockIdx.y*gridDim.x*ss;
-
   auto m_c = mean[blockIdx.x];
   auto inv_std_c = static_cast<accscalar_t>(rsqrt(var[blockIdx.x] + eps));
   auto w_c = static_cast<accscalar_t>(weight[blockIdx.x]);
   auto s_c = static_cast<accscalar_t>(shift[blockIdx.x]);
 
-  for (int offset = threadIdx.x; offset < ss ; offset+= blockDim.x) {
-    out[address_base+offset] = static_cast<scalar_t>(w_c * (static_cast<accscalar_t>(input[address_base+offset]) - m_c ) * inv_std_c + s_c);
+  for (int batch_offset = blockIdx.y; batch_offset < bs; batch_offset += gridDim.y) {
+    int address_base = blockIdx.x*ss + batch_offset*gridDim.x*ss;
+    for (int offset = threadIdx.x + blockIdx.z*blockDim.x; offset < ss ; offset+= gridDim.z*blockDim.x) {
+      out[address_base+offset] = static_cast<scalar_t>(w_c * (static_cast<accscalar_t>(input[address_base+offset]) - m_c ) * inv_std_c + s_c);
+    }
   }
 }
 
@@ -288,17 +332,19 @@ __global__ void batchnorm_backward_kernel(
       const accscalar_t* __restrict__ mean_dy_xmu,
       scalar_t* __restrict__ grad_input,
       const int ss,
+      const int bs,
       const float eps) {
-  int address_base = blockIdx.x*ss + blockIdx.y*gridDim.x*ss;
-
   auto m_c = static_cast<accscalar_t>(mean[blockIdx.x]);
   auto m_dy_c = static_cast<accscalar_t>(mean_dy[blockIdx.x]);
   auto factor_1_c = static_cast<accscalar_t>(var[blockIdx.x]) + eps;
   auto factor_2_c = static_cast<accscalar_t>(weight[blockIdx.x]) / sqrt(factor_1_c);
   factor_1_c /= static_cast<accscalar_t>(mean_dy_xmu[blockIdx.x]);
 
-  for (int offset = threadIdx.x; offset < ss ; offset+= blockDim.x) {
-    grad_input[address_base+offset] = (static_cast<accscalar_t>(grad_output[address_base+offset]) - m_dy_c - (static_cast<accscalar_t>(input[address_base+offset]) - m_c) / factor_1_c) * factor_2_c;
+  for (int batch_offset = blockIdx.y; batch_offset < bs; batch_offset += gridDim.y) {
+    int address_base = blockIdx.x*ss + batch_offset*gridDim.x*ss;
+    for (int offset = threadIdx.x + blockIdx.z*blockDim.x; offset < ss ; offset+= gridDim.z*blockDim.x) {
+      grad_input[address_base+offset] = (static_cast<accscalar_t>(grad_output[address_base+offset]) - m_dy_c - (static_cast<accscalar_t>(input[address_base+offset]) - m_c) / factor_1_c) * factor_2_c;
+    }
   }
 }
 
@@ -350,16 +396,19 @@ std::vector<at::Tensor> welford_mean_var_CUDA(const at::Tensor input) {
   at::Tensor out_var_biased = at::empty({feature_size}, input.options().dtype(scalar_type));
   at::Tensor out_mean = at::empty({feature_size}, input.options().dtype(scalar_type));
 
-  int block_x = TILE_W;
-  int block_y = min(h_last_pow2(batch_size), int(MAX_BLOCK_SIZE / block_x));
+  //int block_x = TILE_W ;
+  int block_y = min(h_last_pow2(batch_size), int(MAX_BLOCK_SIZE / 32));
+  int block_x = max(1, min(MAX_BLOCK_SIZE/block_y, h_last_pow2(space_size)));
   const dim3 block(block_x, block_y);
   const dim3 grid(feature_size);
 
   // shared memory used for reduce on mean, var, num_elements;
+  //int smem_size = block_y * block_x * (sizeof(int) + 2 * get_element_data_size(input, true));
   auto stream = at::cuda::getCurrentCUDAStream();
 
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.type(), "welford_mean_var_kernel", ([&] {
     using accscalar_t = at::acc_type<scalar_t, true>;
+    //welford_kernel<scalar_t, accscalar_t, accscalar_t><<<grid, block, smem_size, stream>>>(
     welford_kernel<scalar_t, accscalar_t, accscalar_t><<<grid, block, 0, stream>>>(
         input.data<scalar_t>(),
         out_mean.data<accscalar_t>(),
@@ -386,9 +435,11 @@ at::Tensor batchnorm_forward_CUDA(
 
   auto space_size = get_tensor_spatial_size(input);
 
-  int block = min(MAX_BLOCK_SIZE, h_next_pow2(space_size)/4);
-  // TODO(jie): should I do 1 block per feature?
-  const dim3 grid(feature_size, batch_size);
+  //int block = max(1, min(MAX_BLOCK_SIZE, h_next_pow2(space_size)/4));
+  int block = max(TILE_W, min(MAX_BLOCK_SIZE, h_next_pow2(space_size)));
+  int grid_z = max(1, min(65535, h_last_pow2(space_size)/4/block));
+  int batch_group_size = max(1, int(batch_size * block / MAX_BLOCK_SIZE));
+  const dim3 grid(feature_size, batch_group_size, grid_z);
   auto stream = at::cuda::getCurrentCUDAStream();
 
   if (input.type().scalarType() == at::ScalarType::Half && weight.type().scalarType() == at::ScalarType::Float) {
@@ -402,6 +453,7 @@ at::Tensor batchnorm_forward_CUDA(
           shift.data<accscalar_t>(),
           out.data<scalar_t>(),
           space_size,
+          batch_size,
           eps);
     }));
   } else {
@@ -416,6 +468,7 @@ at::Tensor batchnorm_forward_CUDA(
           shift.data<scalar_t>(),
           out.data<scalar_t>(),
           space_size,
+          batch_size,
           eps);
     }));
   }
@@ -442,8 +495,8 @@ std::vector<at::Tensor> reduce_bn_CUDA(
 
   auto space_size = get_tensor_spatial_size(input);
 
-  int block_x = TILE_W;
-  int block_y = min(h_last_pow2(batch_size), int(MAX_BLOCK_SIZE / block_x));
+  int block_y = min(h_last_pow2(batch_size), int(MAX_BLOCK_SIZE / 32));
+  int block_x = max(1, min(MAX_BLOCK_SIZE/block_y, h_last_pow2(space_size)));
   const dim3 block(block_x, block_y);
   const dim3 grid(feature_size);
   // shared memory used for reduce on sum_dy, sum_dy_xmu;
@@ -505,9 +558,11 @@ at::Tensor batchnorm_backward_CUDA(
 
   auto space_size = get_tensor_spatial_size(input);
 
-  int block = min(MAX_BLOCK_SIZE, h_next_pow2(space_size)/4);
-  // TODO(jie): should I do 1 block per feature?
-  const dim3 grid(feature_size, batch_size);
+  int block = max(32, min(MAX_BLOCK_SIZE, h_next_pow2(space_size)));
+  int grid_z = max(1, min(65535, h_last_pow2(space_size)/4/block));
+  int batch_group_size = max(1, int(batch_size * block / MAX_BLOCK_SIZE));
+  const dim3 grid(feature_size, batch_group_size, grid_z);
+
   auto stream = at::cuda::getCurrentCUDAStream();
 
   if (input.type().scalarType() == at::ScalarType::Half && weight.type().scalarType() == at::ScalarType::Float) {
@@ -523,6 +578,7 @@ at::Tensor batchnorm_backward_CUDA(
           mean_dy_xmu.data<accscalar_t>(),
           grad_input.data<scalar_t>(),
           space_size,
+          batch_size,
           eps);
     }));
   } else {
@@ -539,6 +595,7 @@ at::Tensor batchnorm_backward_CUDA(
           mean_dy_xmu.data<accscalar_t>(),
           grad_input.data<scalar_t>(),
           space_size,
+          batch_size,
           eps);
     }));
   }
